@@ -1,57 +1,86 @@
-def parse_labsolutions_excel(file):
-    # Read raw dataframe without interpreting row 0 as header
-    df_raw = pd.read_excel(file, header=None)
-    
-    # Replace missing value placeholders ('-----') with NaN
-    df_raw = df_raw.replace('-----', np.nan)
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import streamlit as st
 
-    # Locate row containing peak area headers (Data Filename / H2 / CO2)
-    header_row_idx = None
-    for idx, row in df_raw.iterrows():
-        row_str = row.astype(str).tolist()
-        if any('H2' in cell for cell in row_str) and any('CO2' in cell for cell in row_str):
-            header_row_idx = idx
-            break
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="Catalysis Data Analysis", page_icon="🧪", layout="wide"
+)
 
-    # Fallback to row 0 if keyword match is not found
-    if header_row_idx is None:
-        header_row_idx = 0
+st.title("🧪 Catalysis Performance Dashboard")
 
-    # Separate headers from data rows
-    data_df = df_raw.iloc[header_row_idx + 1:].reset_index(drop=True)
 
-    # Slice Left Block (Data Filename, Sample Name, Sample ID, H2, N2, CH4, CO)
-    left_block = data_df.iloc[:, :7].copy()
-    left_block.columns = ['Data Filename', 'Sample Name', 'Sample ID', 'H2', 'N2', 'CH4', 'CO']
+def prepare_dataframe_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
+    """Cleans up DataFrame column types to ensure PyArrow compatibility.
 
-    # Slice Right Block (Data Filename, Sample Name, Sample ID, Composite, CO2, H2O, CH3OH, DME)
-    right_block = data_df.iloc[:, 9:17].copy()
-    right_block.columns = ['Data Filename', 'Sample Name', 'Sample ID', 'Composite', 'CO2', 'H2O', 'CH3OH', 'DME']
+    - Converts datetime columns to ISO string format or standardized datetimes.
+    - Handles unnamed index columns.
+    """
+    df = df.copy()
 
-    # Drop completely empty rows where Data Filename is NaN or missing
-    left_block = left_block.dropna(subset=['Data Filename'])
-    right_block = right_block.dropna(subset=['Data Filename'])
+    # Drop or rename unnamed empty index columns if present
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
 
-    # Combine into single dataframe
-    gas_cols = ['H2', 'N2', 'CH4', 'CO']
-    right_cols = ['Composite', 'CO2', 'H2O', 'CH3OH', 'DME']
-    
-    clean_df = pd.concat([
-        left_block[['Data Filename', 'Sample Name', 'Sample ID'] + gas_cols].reset_index(drop=True),
-        right_block[right_cols].reset_index(drop=True)
-    ], axis=1)
+    for col in df.columns:
+        # Convert datetime objects to string to avoid PyArrow ArrowTypeError
+        if (
+            pd.api.types.is_datetime64_any_dtype(df[col])
+            or df[col]
+            .apply(lambda x: type(x).__name__ == "datetime")
+            .any()
+        ):
+            df[col] = df[col].astype(str)
+        elif df[col].dtype == "object":
+            # Sanitize mixed object types
+            df[col] = df[col].apply(
+                lambda x: str(x) if pd.notnull(x) else ""
+            )
 
-    # Convert peak area columns to float
-    numeric_cols = gas_cols + right_cols
-    for col in numeric_cols:
-        clean_df[col] = pd.to_numeric(clean_df[col], errors='coerce')
+    return df
 
-    # Convert metadata to strings
-    meta_cols = ['Data Filename', 'Sample Name', 'Sample ID']
-    for col in meta_cols:
-        clean_df[col] = clean_df[col].astype(str)
 
-    # Insert Run # index column
-    clean_df.insert(0, 'Run #', np.arange(1, len(clean_df) + 1))
+# --- SAMPLE DATASET GENERATION ---
+@st.cache_data
+def load_data():
+    data = {
+        "Time_on_Stream_h": np.linspace(0, 24, 10),
+        "Temperature_C": np.linspace(220, 260, 10),
+        "CO2_Conversion_%": np.array(
+            [12.1, 14.3, 16.5, 18.2, 19.0, 18.8, 18.5, 18.2, 18.0, 17.9]
+        ),
+        "MeOH_Selectivity_%": np.array(
+            [65.0, 63.2, 61.5, 60.1, 58.4, 58.0, 57.8, 57.5, 57.2, 57.0]
+        ),
+        "Timestamp": pd.date_range(
+            start="2026-09-25 14:00", periods=10, freq="h"
+        ),
+    }
+    df = pd.DataFrame(data)
+    return prepare_dataframe_for_arrow(df)
 
-    return clean_df, numeric_cols
+
+df = load_data()
+
+# --- DISPLAY METRICS & DATA TABLE ---
+st.subheader("Experimental Results")
+
+# Fixed: Replacing deprecated `use_container_width=True` with `width="stretch"`
+st.dataframe(df, width="stretch")
+
+# --- PLOTTING ---
+st.subheader("CO₂ Conversion & Selectivity Over Time")
+
+fig = px.line(
+    df,
+    x="Time_on_Stream_h",
+    y=["CO2_Conversion_%", "MeOH_Selectivity_%"],
+    labels={
+        "Time_on_Stream_h": "Time on Stream (h)",
+        "value": "Percentage (%)",
+    },
+    title="Reaction Profile",
+)
+
+# Fixed: Replacing deprecated `use_container_width=True` with `width="stretch"`
+st.plotly_chart(fig, width="stretch")
