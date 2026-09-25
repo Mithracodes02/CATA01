@@ -1,205 +1,234 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+import matplotlib.pyplot as plt
+import io
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="GC Data Processing Tool",
-    page_icon="🧪",
-    layout="wide"
-)
-
-st.title("🧪 LabSolutions GC Data Analysis & Kinetics Tool")
-st.markdown("Upload your raw Shimadzu LabSolutions Excel export file to process peak areas, apply response factors, and compute reaction parameters.")
-
-# --- SIDEBAR: PARAMETERS & INPUTS ---
-st.sidebar.header("1. Experimental Parameters")
-
-# Catalyst Mass
-cat_mass = st.sidebar.number_input("Catalyst Mass (g)", min_value=0.001, value=0.100, step=0.010, format="%.3f")
-
-# Feed Gas Composition
-st.sidebar.subheader("Feed Gas Composition (vol% / mol%)")
-col_f1, col_f2 = st.sidebar.columns(2)
-feed_h2 = col_f1.number_input("H₂ (%)", min_value=0.0, value=65.0, step=0.5)
-feed_co2 = col_f2.number_input("CO₂ (%)", min_value=0.0, value=22.0, step=0.5)
-feed_co = col_f1.number_input("CO (%)", min_value=0.0, value=3.0, step=0.5)
-feed_n2 = col_f2.number_input("N₂ (%)", min_value=0.0, value=10.0, step=0.5)
-
-# Calculate Stoichiometric Number (SN)
-# SN = (H2 - CO2) / (CO + CO2)
-if (feed_co + feed_co2) > 0:
-    sn_val = (feed_h2 - feed_co2) / (feed_co + feed_co2)
-else:
-    sn_val = 0.0
-
-st.sidebar.metric("Stoichiometric Number (SN)", f"{sn_val:.2f}")
-
-# --- SIDEBAR: RESPONSE FACTORS ---
-st.sidebar.subheader("2. Response Factors (RF)")
-st.sidebar.caption("Corrected Area = Raw Area × RF")
-
-# Default relative response factors
-default_rf = {
-    "H2": 1.000,
-    "N2": 1.000,      # Reference Internal Standard
-    "CH4": 1.120,
-    "CO": 1.050,
-    "CO2": 1.250,
-    "H2O": 1.000,
-    "CH3OH": 1.450,
-    "DME": 1.820
-}
-
-rf_dict = {}
-cols_rf = st.sidebar.columns(2)
-for i, (k, v) in enumerate(default_rf.items()):
-    c = cols_rf[i % 2]
-    rf_dict[k] = c.number_input(f"RF {k}", min_value=0.001, value=float(v), step=0.01, format="%.3f")
-
-
-# --- HELPER FUNCTION TO PARSE LABSOLUTIONS EXCEL SHEETS ---
-def parse_labsolutions_sheet(df):
+def analyze_fastgc_excel(
+    file_path,
+    blank_sheet_name="Blank",
+    response_factors=None,
+    inlet_flows=None,
+    cat_mass_g=0.1,
+    output_report_path="Catalyst_Activity_Report.xlsx"
+):
     """
-    Parses dual TCD/FID multi-column layout from Shimadzu LabSolutions export.
-    Combines TCD (H2, N2, CH4, CO) and FID/TCD2 (Composite, CO2, H2O, CH3OH, DME).
+    Analyzes multi-sheet Excel files containing GC peak area data from Fast GC experiments.
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to the Excel file containing experiment sheets.
+    blank_sheet_name : str
+        Name of the sheet containing blank baseline / response factor data.
+    response_factors : dict
+        Response factors relative to reference (e.g., N2 = 1.0).
+        Example: {'H2': 1.0, 'N2': 1.0, 'CO': 0.85, 'CO2': 0.92, 'CH4': 0.78, 'CH3OH': 0.65, 'DME': 0.55}
+    inlet_flows : dict
+        Inlet molar/volumetric flows (Nml/min) for each gas component.
+        Example: {'H2': 23.25, 'CO2': 4.65, 'CO': 4.65, 'N2': 2.45}
+    cat_mass_g : float
+        Catalyst mass loaded in grams (default 0.1 g).
+    output_report_path : str
+        Filename for the generated downloadable Excel activity report.
     """
-    # Clean whitespace in column headers
-    df.columns = [str(c).strip() for c in df.columns]
     
-    # Identify compound columns present in the sheet
-    compounds = ["H2", "N2", "CH4", "CO", "CO2", "H2O", "CH3OH", "DME"]
-    found_cols = [c for c in compounds if c in df.columns]
-    
-    # Extract peak area columns and clean numeric data
-    for col in found_cols:
-        df[col] = pd.to_numeric(df[col].astype(str).str.replace(" ", "").str.replace("----", "0"), errors='coerce').fillna(0)
-    
-    # Extract metadata if present
-    meta_cols = [c for c in ["Data Filename", "Sample Name", "Sample ID"] if c in df.columns]
-    
-    # Filter to non-empty records
-    data = df[found_cols].copy()
-    if meta_cols:
-        data = pd.concat([df[meta_cols], data], axis=1)
+    # 1. Default Configurations if not provided
+    if response_factors is None:
+        response_factors = {
+            'H2': 1.00, 'N2': 1.00, 'CO': 0.85,
+            'CO2': 0.92, 'CH4': 0.78, 'CH3OH': 0.65, 'DME': 0.55
+        }
         
-    return data
+    if inlet_flows is None:
+        inlet_flows = {
+            'H2': 23.25, 'CO2': 4.65, 'CO': 4.65, 'N2': 2.45
+        }
+
+    xls = pd.ExcelFile(file_path)
+    all_sheets = xls.sheet_names
+    
+    # Exclude non-test sheets
+    ignore_sheets = [blank_sheet_name, 'Graphs', 'Feuil1', 'Feuil3', 'Summary']
+    test_sheets = [s for s in all_sheets if s not in ignore_sheets]
+
+    summary_records = []
+    processed_dfs = {}
+
+    print(f"Found {len(test_sheets)} test sheet(s) to process: {test_sheets}\n")
+
+    # 2. Process each test sheet
+    for sheet in test_sheets:
+        df_raw = pd.read_excel(file_path, sheet_name=sheet)
+        
+        # Identify peak area columns
+        # (Assumes columns in sheet contain Peak Areas for H2, N2, CO, CO2, CH4, CH3OH, DME)
+        results = pd.DataFrame()
+        
+        # Copy original raw peak areas present in the sheet
+        for comp in response_factors.keys():
+            matching_cols = [c for c in df_raw.columns if comp.lower() in str(c).lower() and 'area' in str(c).lower()]
+            if matching_cols:
+                results[f'Area_{comp}'] = pd.to_numeric(df_raw[matching_cols[0]], errors='coerce')
+            elif comp in df_raw.columns:
+                results[f'Area_{comp}'] = pd.to_numeric(df_raw[comp], errors='coerce')
+
+        if results.empty:
+            print(f"Skipping sheet '{sheet}': No matching peak area columns found.")
+            continue
+
+        # Calculate Corrected Areas (Area / Response Factor)
+        for comp, rf in response_factors.items():
+            if f'Area_{comp}' in results.columns:
+                results[f'CorrArea_{comp}'] = results[f'Area_{comp}'] / rf
+
+        # Calculate Outlet Flows using N2 as Internal Standard
+        # F_i_out = (CorrArea_i / CorrArea_N2) * F_N2_in
+        if 'CorrArea_N2' in results.columns and 'N2' in inlet_flows:
+            corr_n2 = results['CorrArea_N2']
+            f_n2_in = inlet_flows['N2']
+            
+            for comp in response_factors.keys():
+                if comp != 'N2' and f'CorrArea_{comp}' in results.columns:
+                    results[f'F_{comp}_out'] = (results[f'CorrArea_{comp}'] / corr_n2) * f_n2_in
+
+        # Reaction Metrics Calculation
+        f_co_in = inlet_flows.get('CO', 0)
+        f_co2_in = inlet_flows.get('CO2', 0)
+        f_h2_in = inlet_flows.get('H2', 0)
+        f_cox_in = f_co_in + f_co2_in
+
+        f_co_out = results.get('F_CO_out', 0)
+        f_co2_out = results.get('F_CO2_out', 0)
+        f_h2_out = results.get('F_H2_out', 0)
+        f_meoh_out = results.get('F_CH3OH_out', 0)
+        f_dme_out = results.get('F_DME_out', 0)
+        f_ch4_out = results.get('F_CH4_out', 0)
+
+        # Conversions (%)
+        if f_cox_in > 0:
+            results['X_COx (%)'] = 100 * (f_cox_in - (f_co_out + f_co2_out)) / f_cox_in
+        if f_co_in > 0:
+            results['X_CO_app (%)'] = 100 * (f_co_in - f_co_out) / f_co_in
+        if f_co2_in > 0:
+            results['X_CO2_app (%)'] = 100 * (f_co2_in - f_co2_out) / f_co2_in
+        if f_h2_in > 0:
+            results['X_H2 (%)'] = 100 * (f_h2_in - f_h2_out) / f_h2_in
+
+        # Yields & Selectivities (%)
+        if f_cox_in > 0:
+            results['Y_MeOH (%)'] = 100 * f_meoh_out / f_cox_in
+            results['Y_DME (%)'] = 100 * (2 * f_dme_out) / f_cox_in
+            results['Y_CH4 (%)'] = 100 * f_ch4_out / f_cox_in
+
+            # Selectivities relative to reacted COx
+            converted_cox = f_cox_in - (f_co_out + f_co2_out)
+            results['S_MeOH (%)'] = np.where(converted_cox > 0, 100 * f_meoh_out / converted_cox, 0)
+            results['S_DME (%)'] = np.where(converted_cox > 0, 100 * (2 * f_dme_out) / converted_cox, 0)
+            results['S_CH4 (%)'] = np.where(converted_cox > 0, 100 * f_ch4_out / converted_cox, 0)
+
+        # Methanol Productivity (g_MeOH * kg_cat^-1 * h^-1)
+        # F_CH3OH_out (Nml/min) -> mmol/min using molar volume (~22.414 Nml/mmol) or directly via molar mass
+        mw_meoh = 32.042  # g/mol
+        results['MeOH_Productivity'] = (60 * 1000 * f_meoh_out * mw_meoh) / (22414 * cat_mass_g)
+
+        # Elemental Balances (%)
+        if f_cox_in > 0:
+            results['Delta_C (%)'] = 100 * (f_cox_in - (f_ch4_out + f_co_out + f_co2_out + f_meoh_out + 2 * f_dme_out)) / f_cox_in
+
+        processed_dfs[sheet] = results
+
+        # Compute Steady-State Averages for Summary Report
+        avg_row = {
+            'Test_Condition_Sheet': sheet,
+            'X_COx (%)': results['X_COx (%)'].mean() if 'X_COx (%)' in results else np.nan,
+            'X_H2 (%)': results['X_H2 (%)'].mean() if 'X_H2 (%)' in results else np.nan,
+            'Y_MeOH (%)': results['Y_MeOH (%)'].mean() if 'Y_MeOH (%)' in results else np.nan,
+            'Y_DME (%)': results['Y_DME (%)'].mean() if 'Y_DME (%)' in results else np.nan,
+            'S_MeOH (%)': results['S_MeOH (%)'].mean() if 'S_MeOH (%)' in results else np.nan,
+            'MeOH_Productivity (g/kg_cat/h)': results['MeOH_Productivity'].mean() if 'MeOH_Productivity' in results else np.nan,
+            'Delta_C_Balance (%)': results['Delta_C (%)'].mean() if 'Delta_C (%)' in results else np.nan
+        }
+        summary_records.append(avg_row)
+
+    df_summary = pd.DataFrame(summary_records)
+
+    # 3. Generate Analysis Plot Across Conditions / Temperature
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot 1: Conversion & Selectivity
+    if 'X_COx (%)' in df_summary.columns:
+        axes[0].bar(df_summary['Test_Condition_Sheet'], df_summary['X_COx (%)'], color='skyblue', label='X_COx (%)')
+        axes[0].set_ylabel('Conversion (%)')
+        axes[0].set_title('COx Conversion across Conditions')
+        axes[0].tick_params(axis='x', rotation=30)
+        axes[0].grid(True, linestyle='--', alpha=0.5)
+
+    # Plot 2: Methanol Productivity
+    if 'MeOH_Productivity (g/kg_cat/h)' in df_summary.columns:
+        axes[1].plot(df_summary['Test_Condition_Sheet'], df_summary['MeOH_Productivity (g/kg_cat/h)'], marker='o', color='green', linewidth=2, label='MeOH Productivity')
+        axes[1].set_ylabel('Productivity (g_MeOH kg_cat⁻¹ h⁻¹)')
+        axes[1].set_title('Methanol Productivity across Conditions')
+        axes[1].tick_params(axis='x', rotation=30)
+        axes[1].grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig('catalyst_activity_summary.png', dpi=300)
+    plt.close()
+    print("Summary plot saved as 'catalyst_activity_summary.png'.")
+
+    # 4. Export Downloadable Excel Activity Report
+    with pd.ExcelWriter(output_report_path, engine='openpyxl') as writer:
+        # Write Overview / Summary Sheet
+        df_summary.to_excel(writer, sheet_name='Activity Summary', index=False)
+        
+        # Write Calibration & Input Parameters
+        df_inputs = pd.DataFrame([
+            {'Parameter': 'Catalyst Mass (g)', 'Value': cat_mass_g},
+            {'Parameter': 'Inlet H2 (Nml/min)', 'Value': inlet_flows.get('H2', 0)},
+            {'Parameter': 'Inlet CO2 (Nml/min)', 'Value': inlet_flows.get('CO2', 0)},
+            {'Parameter': 'Inlet CO (Nml/min)', 'Value': inlet_flows.get('CO', 0)},
+            {'Parameter': 'Inlet N2 (Nml/min)', 'Value': inlet_flows.get('N2', 0)},
+        ] + [{'Parameter': f'RF_{k}', 'Value': v} for k, v in response_factors.items()])
+        df_inputs.to_excel(writer, sheet_name='Parameters & RFs', index=False)
+
+        # Write detailed computed calculations for each test sheet
+        for sheet, df_res in processed_dfs.items():
+            clean_sheet_name = sheet[:31]  # Excel max sheet name limit
+            df_res.to_excel(writer, sheet_name=clean_sheet_name, index=False)
+
+    print(f"\nDownloadable Catalyst Activity Report created successfully at: '{output_report_path}'")
+    return df_summary, processed_dfs
 
 
-# --- MAIN FILE UPLOADER ---
-uploaded_file = st.file_uploader("Upload Excel File (.xlsx)", type=["xlsx", "xls"])
+# ==========================================
+# EXECUTION EXAMPLE
+# ==========================================
+if __name__ == '__main__':
+    # Customizable Response Factors (RFs)
+    user_response_factors = {
+        'H2': 1.00,
+        'N2': 1.00,
+        'CO': 0.85,
+        'CO2': 0.92,
+        'CH4': 0.78,
+        'CH3OH': 0.65,
+        'DME': 0.55
+    }
 
-if uploaded_file is not None:
-    # Read all sheet names
-    excel_file = pd.ExcelFile(uploaded_file)
-    sheet_names = excel_file.sheet_names
-    
-    st.success(f"File loaded successfully! Found {len(sheet_names)} sheet(s).")
-    
-    # Sheet Selection
-    selected_sheet = st.selectbox("Select Sheet / Condition to Analyze:", sheet_names)
-    
-    # Read raw sheet
-    raw_df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
-    
-    st.subheader(f"Raw Data Preview: `{selected_sheet}`")
-    st.dataframe(raw_df.head(10), use_container_width=True)
-    
-    # Process sheet
-    parsed_df = parse_labsolutions_sheet(raw_df)
-    
-    if not parsed_df.empty:
-        # Step 1: Calculate Corrected Peak Areas
-        corr_df = parsed_df.copy()
-        for comp, rf in rf_dict.items():
-            if comp in corr_df.columns:
-                corr_df[f"{comp}_CorrArea"] = corr_df[comp] * rf
-        
-        # Step 2: Sum of Corrected Areas & Mole Fractions
-        corr_cols = [f"{c}_CorrArea" for c in rf_dict.keys() if f"{c}_CorrArea" in corr_df.columns]
-        corr_df["Total_CorrArea"] = corr_df[corr_cols].sum(axis=1)
-        
-        # Mole fractions (molar concentration %)
-        for comp in rf_dict.keys():
-            if f"{comp}_CorrArea" in corr_df.columns:
-                corr_df[f"{comp}_mol%"] = np.where(
-                    corr_df["Total_CorrArea"] > 0,
-                    (corr_df[f"{comp}_CorrArea"] / corr_df["Total_CorrArea"]) * 100,
-                    0
-                )
-        
-        # Step 3: Performance Calculations (CO2 Conversion & Product Selectivity)
-        # Using N2 internal standard normalization
-        if "N2_mol%" in corr_df.columns and "CO2_mol%" in corr_df.columns:
-            # CO2 conversion based on N2 balance
-            n2_in = feed_n2
-            co2_in = feed_co2
-            
-            # (CO2/N2)in vs (CO2/N2)out
-            ratio_in = co2_in / n2_in if n2_in > 0 else 1.0
-            ratio_out = np.where(corr_df["N2_mol%"] > 0, corr_df["CO2_mol%"] / corr_df["N2_mol%"], 0)
-            
-            corr_df["CO2_Conv_%"] = np.maximum(0, (1 - (ratio_out / ratio_in)) * 100)
-            
-            # Carbon-based selectivities
-            carbon_products = ["CH3OH", "DME", "CO", "CH4"]
-            total_carbon_prod = sum([corr_df[f"{p}_mol%"] * (2 if p == "DME" else 1) for p in carbon_products if f"{p}_mol%" in corr_df.columns])
-            
-            for p in carbon_products:
-                if f"{p}_mol%" in corr_df.columns:
-                    factor = 2 if p == "DME" else 1
-                    corr_df[f"{p}_Selectivity_%"] = np.where(
-                        total_carbon_prod > 0,
-                        (corr_df[f"{p}_mol%"] * factor / total_carbon_prod) * 100,
-                        0
-                    )
-        
-        # --- TABS FOR ORGANIZED OUTPUT ---
-        tab1, tab2, tab3 = st.tabs(["📊 Calculated Results", "📈 Time-on-Stream Plots", "📥 Export Processed Data"])
-        
-        with tab1:
-            st.subheader("Processed Molar Concentrations & Conversions")
-            
-            # Filter output columns for clean presentation
-            display_cols = [c for c in corr_df.columns if "mol%" in c or "Conv_%" in c or "Selectivity_%" in c]
-            st.dataframe(corr_df[display_cols].round(2), use_container_width=True)
-            
-        with tab2:
-            st.subheader("Performance Trends Across Injections / TOS")
-            
-            if "CO2_Conv_%" in corr_df.columns:
-                corr_df["Injection"] = corr_df.index + 1
-                
-                # Conversion plot
-                fig_conv = px.line(
-                    corr_df, x="Injection", y="CO2_Conv_%", 
-                    title=f"CO₂ Conversion vs Injection Sequence ({selected_sheet})",
-                    markers=True, labels={"CO2_Conv_%": "CO₂ Conversion (%)"}
-                )
-                st.plotly_chart(fig_conv, use_container_width=True)
-                
-                # Selectivity plot
-                sel_cols = [c for c in corr_df.columns if "Selectivity_%" in c]
-                if sel_cols:
-                    fig_sel = px.line(
-                        corr_df, x="Injection", y=sel_cols,
-                        title=f"Product Selectivity vs Injection Sequence ({selected_sheet})",
-                        markers=True, labels={"value": "Selectivity (%)", "variable": "Product"}
-                    )
-                    st.plotly_chart(fig_sel, use_container_width=True)
-            else:
-                st.info("Insufficient compound columns found to plot conversion trends.")
+    # Customizable Gas Molar Inlet Composition / Flow Rates (Nml/min)
+    user_inlet_flows = {
+        'H2': 23.25,
+        'CO2': 4.65,
+        'CO': 4.65,
+        'N2': 2.45
+    }
 
-        with tab3:
-            st.subheader("Download Complete Processed Dataset")
-            csv_data = corr_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="⬇️ Download Processed CSV",
-                data=csv_data,
-                file_name=f"Processed_{selected_sheet}.csv",
-                mime="text/csv"
-            )
-
-else:
-    st.info("👆 Please upload a Shimadzu LabSolutions `.xlsx` data file to begin processing.")
+    # Execute analysis on your workbook
+    # analyze_fastgc_excel(
+    #     file_path='your_catalyst_data.xlsx',
+    #     blank_sheet_name='Blank',
+    #     response_factors=user_response_factors,
+    #     inlet_flows=user_inlet_flows,
+    #     cat_mass_g=0.10,
+    #     output_report_path='Catalyst_Activity_Report.xlsx'
+    # )
