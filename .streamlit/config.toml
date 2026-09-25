@@ -1,10 +1,11 @@
-Ini, TOML
-
 [theme]
-primaryColor = "#0e1117"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
-textColor = "#313339"
+primaryColor = "#FF4B4B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#31333F"
+font = "sans serif"
 
 [server]
-maxUploadSize = 200
+headless = true
+port = 8501
+enableCORS = false
